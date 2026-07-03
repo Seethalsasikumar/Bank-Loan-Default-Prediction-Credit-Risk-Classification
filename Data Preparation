@@ -1,0 +1,833 @@
+import os
+
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import numpy as np
+
+from sklearn.exceptions import ConvergenceWarning
+import warnings
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+
+import lightgbm as lgb
+import xgboost as xgb
+from catboost import CatBoostClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestRegressor,  RandomForestClassifier
+
+from scipy.stats import chi2_contingency, boxcox, zscore
+from sklearn.preprocessing import StandardScaler, LabelEncoder, RobustScaler
+from scipy import stats
+import missingno as msno
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import ( 
+make_scorer, classification_report, auc,
+roc_auc_score, confusion_matrix, roc_curve, precision_score, 
+recall_score, precision_recall_curve, accuracy_score, f1_score,
+ConfusionMatrixDisplay, fbeta_score
+)
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split, cross_val_score, learning_curve
+
+============================================================================
+
+# IMPORT AND UNDERSTAND THE DATA
+
+============================================================================
+
+os.getcwd()
+
+df = pd.read_csv('data.csv')
+df.head()
+
+# ------------------------------------------
+# Step 2: Descriptive Statistics
+# ------------------------------------------
+print("\n§§§ Numerical Variables §§§")
+print(df.describe())
+
+print("\n§§§ Categorical Variables §§§")
+print(df[['REASON', 'JOB']].describe(include='object'))
+
+## Correlation matrix and Scatter plots
+
+numerical_columns = df.select_dtypes(include=['number']).columns
+df_numerical = df[numerical_columns]
+
+#correlation matrix for numerical columns
+corr_matrix = df_numerical.corr()
+corr_matrix
+
+# Visualize the correlation matrix using a heatmap
+plt.figure(figsize=(8, 6))  # Set the figure size for the heatmap
+sns.heatmap(corr_matrix, annot=True, fmt='.2f', vmin=-1, vmax=1, 
+            cbar_kws={'label': 'Correlation Coefficient'}, linewidths=0.5)
+
+# Title and layout
+plt.title('Correlation Matrix Heatmap', fontsize=16)
+plt.tight_layout()
+
+# Show the plot
+plt.show()
+
+# Create a pairplot (scatter plot matrix) for all numeric variables in the DataFrame
+sns.pairplot(df)
+plt.show() 
+
+============================================================================
+
+# DATA CLEANING
+
+============================================================================
+
+## Missing values
+
+print("\n§§§ Missing Values §§§")
+missing = df.isnull().sum().to_frame(name='Missing Count')
+missing['Missing %'] = (missing['Missing Count'] / len(df)) * 100
+print(missing)
+
+# Visualize missing data
+msno.matrix(df)
+plt.title("Missing Data Pattern")
+plt.show()
+
+### MCAR Hypothesis Test
+Missing Completely at Random (MCAR) refers to a situation where the probability of missing data is independent of both observed and unobserved data.
+1. p > 0.05 → Fail to reject the null hypothesis → Data is MCAR (missing completely at random).
+2. p ≤ 0.05 → Reject the null hypothesis → Data is MAR or MNAR, meaning missingness follows a pattern.
+
+def mcar_mar_test(df):
+    results = {}
+    for col in df.columns:
+        if df[col].isnull().any():
+            # Test for MCAR using Little's MCAR test
+            observed = df.isnull().sum()
+            expected = observed.mean()
+            chi2_stat, p_value, _, _ = chi2_contingency(pd.crosstab(df.isnull().any(axis=1), df[col].isnull()))
+
+            if p_value > 0.05:
+                results[col] = {"Result": "MCAR", "p-value": p_value}
+            else:
+                results[col] = {"Result": "MAR", "p-value": p_value}
+        else:
+            results[col] = {"Result": "No missing values", "p-value": None}
+    return results
+
+# Assuming 'df' is your DataFrame
+missing_data_results = mcar_mar_test(df)
+for col, result in missing_data_results.items():
+    print(f"Column: {col}, Result: {result['Result']}, p-value: {result['p-value']}")
+
+#### Conclusion: Data is Missing at Random
+Missing at Random, this implies that the probability of data being missing is related to observed data, but not to the missing values themselves.
+
+Imputation methods:
+1. KNN Imputation: K-Nearest Neighbors imputation can also handle MAR data well, as it uses the similarity between rows (based on observed variables) to impute missing values.
+
+2. Iterative Imputation: Another common method, especially with IterativeImputer, which models each variable as a function of other variables in the dataset.
+
+3. Random Forest Imputation: Random Forests can be effective for MAR data because they consider other variables when predicting the missing values, helping to reflect relationships between the variables.
+
+### Drop Rows with >=8 missing values
+
+
+# No. of rows before dropping
+initial_row_count = len(df)
+
+# Drop rows with 8 or more missing values
+df_rowdrop = df.dropna(thresh=len(df.columns) - 8)
+
+# No. of rows after dropping
+final_row_count = len(df_rowdrop)
+
+# No. and % of rows dropped
+rows_dropped = initial_row_count - final_row_count
+percentage_dropped = (rows_dropped / initial_row_count) * 100
+
+# Display the cleaned DataFrame
+print("Cleaned DataFrame:")
+print(df_rowdrop)
+
+# Output the number and % of rows dropped
+print(f"\nTotal rows dropped: {rows_dropped}")
+print(f"\nPercentage of rows dropped: {percentage_dropped:.2f}%")
+
+df_rowdrop.to_csv('df_rowdrop.csv', index=False)
+
+### Analyse missing data after row drops
+
+print("\n§§§ Missing Values §§§")
+missing = df_rowdrop.isnull().sum().to_frame(name='Missing Count')
+missing['Missing %'] = (missing['Missing Count'] / len(df_rowdrop)) * 100
+print(missing)
+
+# Visualize missing data
+msno.matrix(df_rowdrop)
+plt.title("Missing Data Pattern")
+plt.show()
+
+## Analyse the best imputation method based on column's distribution
+
+# Iterate over all numerical columns and calculate skewness and kurtosis
+numerical_cols = df_rowdrop.select_dtypes(include=['number']).columns
+
+# Initialize lists to store the variable names, skewness, kurtosis, and reasons for imputation choice
+variables = []
+skewness_values = []
+kurtosis_values = []
+imputation_reasons = []
+
+for col in numerical_cols:
+    variables.append(col)
+    skewness = df_rowdrop[col].skew()
+    kurtosis = df_rowdrop[col].kurtosis()
+    
+    skewness_values.append(skewness)
+    kurtosis_values.append(kurtosis)  
+
+    # Determine imputation reason based on skewness and kurtosis
+    if skewness > 1 or kurtosis > 10:
+        # High skewness or high kurtosis: Not ideal for mean/median imputation
+        imputation_reasons.append(f"Use KNN/Iterative Imputer/Random Forest; Mean/Median not suitable due to high skewness and/or heavy tails (kurtosis).")
+    elif skewness < -1 or kurtosis < -10:
+        # If there is significant negative skew or outliers
+        imputation_reasons.append(f"Use KNN/Iterative Imputer; Mean/Median may not capture negative skew and outliers well.")
+    else:
+        # For less skewed data (skewness close to 0) and moderate kurtosis
+        imputation_reasons.append("Mean/Median may work fine for imputation.")
+
+# Create a DataFrame from the lists
+skew_kurt_df = pd.DataFrame({
+    'Variable': variables,
+    'Skewness': skewness_values,
+    'Kurtosis': kurtosis_values,
+    'Imputation Method Explanation': imputation_reasons
+})
+
+# Display the table
+print(skew_kurt_df)
+
+## Impute missing values using Random Forests in Iterative Imputer
+
+#### Why this imputation method?
+1. Random Forest can handle both numerical and categorical variables, making it suitable for datasets with mixed data types. 
+2. It is capable of capturing non-linear relationships between variables, which is a significant advantage over linear imputation methods.
+3. It inherently models interactions between features, which can improve the accuracy of imputed values.
+4. It is less sensitive to outliers compared to other methods making it a more robust choice for datasets with noisy or skewed distributions.
+5. The IterativeImputer in scikit-learn uses a chained equations approach, where each variable is imputed sequentially. This iterative process allows the imputer to refine its estimates by using the most recently imputed values, leading to more accurate imputations.
+
+Empirical Performance:
+Empirical studies have shown that Random Forest-based imputation methods often outperform traditional imputation techniques in terms of accuracy and robustness. This is particularly true for datasets with complex structures and non-linear relationships.
+
+df = df_rowdrop.copy()
+
+%%time
+
+# Identify numerical and categorical columns with missing values
+numerical_cols_with_missing = df.select_dtypes(include=np.number).columns[df.select_dtypes(include=np.number).isnull().any()]
+categorical_cols_with_missing = df.select_dtypes(exclude=np.number).columns[df.select_dtypes(exclude=np.number).isnull().any()]
+
+# Create imputers
+numerical_imputer = IterativeImputer(estimator=RandomForestRegressor(n_estimators=100, random_state=0),
+                                     max_iter=10, random_state=0)
+categorical_imputer = IterativeImputer(estimator=RandomForestClassifier(n_estimators=100, random_state=0),
+                                       max_iter=10, random_state=0)
+
+# Create a copy of the DataFrame to store imputed values
+df_imputed = df.copy()
+
+# Fit and transform numerical columns
+df_imputed[numerical_cols_with_missing] = numerical_imputer.fit_transform(df_imputed[numerical_cols_with_missing])
+
+# Handle categorical columns using one-hot encoding before and after imputation
+df_imputed = pd.get_dummies(df_imputed, columns=categorical_cols_with_missing, dummy_na=True)
+
+# Find the columns that were one-hot encoded
+one_hot_cols = [col for col in df_imputed.columns if any(cat_col in col for cat_col in categorical_cols_with_missing)]
+
+# Impute missing values in the one-hot encoded columns
+df_imputed[one_hot_cols] = categorical_imputer.fit_transform(df_imputed[one_hot_cols])
+
+# Round the imputed values in the one-hot encoded columns to 0 or 1
+for col in one_hot_cols:
+  df_imputed[col] = np.round(df_imputed[col])
+
+#save the imputed df to csv to compare manually
+df_imputed.to_csv('FINAL_df_imputed.csv', index=False)
+
+## Analyse missing data after Iterative Imputation
+
+print("\n§§§ Missing Values §§§")
+missing = df_imputed.isnull().sum().to_frame(name='Missing Count')
+missing['Missing %'] = (missing['Missing Count'] / len(df_imputed)) * 100
+print(missing)
+
+# Visualize missing data
+msno.matrix(df_imputed)
+plt.title("Missing Data Pattern")
+plt.show()
+
+
+# Assuming df_imputed contains the imputed data
+# Loop over each feature
+for x in ['MORTDUE', 'VALUE', 'YOJ', 'DEROG', 'DELINQ', 'CLAGE', 'NINQ', 'CLNO', 'DEBTINC']:
+    plt.figure(figsize=(10, 4))
+    
+    # Plot the original (non-missing) data
+    sns.histplot(df[x].dropna(), kde=True, color="blue", label="Original (Non-Missing)")
+    
+    # Plot the imputed data
+    sns.histplot(df_imputed[x], kde=True, color="red", label="Imputed")
+    
+    # Set the title dynamically based on the column name
+    plt.title(f"{x} Distribution Before/After Imputation")
+    
+    # Add a legend to differentiate the plots
+    plt.legend()
+    
+    # Show the plot
+    plt.show()
+
+Calculate mutual information (similar to correlation matrix but captures non linear relationships)
+
+from sklearn.feature_selection import mutual_info_classif
+X = df_imputed.drop(columns=["BAD"])
+y = df_imputed["BAD"]
+correlations = []
+mi = mutual_info_classif(X, y, discrete_features='auto',random_state=42)
+for i, col in enumerate(X.columns):
+    correlations.append((col, "Mutual Info", mi[i]))
+
+print("Mutual information between dependent and independent variable:")
+correlations
+
+============================================================================
+
+# DATA REDUCTION
+
+============================================================================
+
+print(df_imputed.info())
+data_convert = df_imputed.copy()
+
+data_convert
+
+#Create new variables
+#Amount of the loan request - Value of current property ratio 
+#higher ratio shows the loan requested is high but with low property, which is bad to the bank
+data_convert['LoanPropertyRatio'] = data_convert['LOAN'] / (data_convert['VALUE'] + 1e-6) 
+
+#Age of oldest credit line in months - Number of credit lines ratio
+#higher ratio shows the credit of this customer is long, which is more stable and reliable to the bank
+data_convert['CreditAgeRatio'] = data_convert['CLAGE'] / (data_convert['CLNO'] + 1e-6) 
+
+#Number of delinquent credit lines - Number of credit lines ratio
+#higher ratio shows the customer tends not to pay the debt, which is bad to the bank
+data_convert['CreditDelRatio'] = data_convert['DELINQ'] / (data_convert['CLNO'] + 1e-6) 
+print(data_convert.head(10))
+
+#Correlation matrix
+correlation_matrix = data_convert.corr()
+
+#heatmap
+plt.figure(figsize=(12, 8))
+sns.heatmap(correlation_matrix, annot=True, fmt=".2f", cmap="coolwarm")
+plt.title("Feature Correlation Matrix Before")
+plt.show()
+
+corr_threshold = 0.9
+high_corr_pairs = set()
+corr_matrix = correlation_matrix.abs()
+
+for i in range(len(corr_matrix.columns)):
+    for j in range(i):  
+        if corr_matrix.iloc[i, j] > corr_threshold:
+            col1 = corr_matrix.columns[i]
+            col2 = corr_matrix.columns[j]
+            high_corr_pairs.add((col1, col2))
+            print(f"High correlation between {col1} and {col2}: {corr_matrix.iloc[i, j]:.2f}")
+
+#drop variables
+data_to_reduce = data_convert.drop(columns=['REASON_HomeImp'])
+print(data_convert.info())
+print(data_to_reduce.info())
+
+#Correlation matrix again
+correlation_matrix_after = data_to_reduce.corr()
+
+#heatmap
+plt.figure(figsize=(12, 8))
+sns.heatmap(correlation_matrix_after, annot=True, fmt=".2f", cmap="coolwarm")
+plt.title("Feature Correlation Matrix After")
+plt.show()
+
+#Remove low variance variable which doesn't show data differences
+variance_threshold = 0.01  
+print(data_to_reduce.var())
+low_variance_cols = data_to_reduce.var()[data_to_reduce.var() < variance_threshold].index.tolist()
+data_to_reduce.drop(columns=low_variance_cols, inplace=True)
+print("Dropped low variance columns:", low_variance_cols)
+print(data_to_reduce)
+
+#Remove columns that have only one kind of value
+print(data_to_reduce.nunique())
+data_to_reduce = data_to_reduce.loc[:, data_to_reduce.nunique() > 1]
+print(data_to_reduce.info())
+
+data_to_reduce.to_csv("reduced_data.csv")
+
+============================================================================
+
+# DATA TRANSFORMATION
+
+============================================================================
+
+## Applying Box Cox,Log and Square root Transformations
+#### - Given the high skewness of the data, data transformation techniques have been applied to get close to a normal distribution.
+#### - Due to the high skewness of the data (predominantely right-skewed), the Box-Cox transformation with its special cases (Log and sqrt transformations) were used. These transformations are known for being efficient in compressing positively-skewed data.
+#### - Lastly, Z-score approach was applied to detect and remove outliers. After applying the above transformations and moving the data close to a normal distribution, Z-score approach was efficient knowing that it is mainly applied on normally distributed data.
+
+
+## Log, Square root, and Box-Cox Transformation
+
+### The below code applies one of the above transformations based on the skewness level and min value of each column
+
+def transform_column_by_skew(data_to_reduce, numerical_cols):
+
+    df_transformed = data_to_reduce.copy()
+
+    for col in numerical_cols:
+        if col in df_transformed.columns:
+            skew_val = df_transformed[col].skew()
+
+            print(f"\n--- Processing column: {col} ---")
+            print(f"Skewness before transformation: {skew_val:.4f}")
+            print(f"Minimum value before transformation: {df_transformed[col].min():.4f}")
+
+            if skew_val > 1:
+                # Log transform if data is positive and min value >= 1, otherwise use Box-Cox
+                min_val = df_transformed[col].min()
+                if min_val < 1:
+                    print(f"Column {col} has values less than 1. Using Box-Cox instead of log.")
+                    df_transformed[col], _ = boxcox(df_transformed[col] - df_transformed[col].min() + 1)
+                    trans = 'boxcox'
+                else:
+                    df_transformed[col] = np.log(df_transformed[col])
+                    trans = 'log'
+                    print(f"Transformation applied: {trans}")
+            elif 0.5 < skew_val <= 1:
+                min_val = df_transformed[col].min()
+                shift = 0 if min_val >= 0 else -min_val
+                df_transformed[col] = np.sqrt(df_transformed[col] + shift)
+                trans = 'sqrt'
+                print(f"Due to moderate positive skewness, transformation applied: {trans}")
+            elif -1.0 <= skew_val < -0.5:
+                # Apply inverse square root transformation for moderately negative skew
+                max_val = df_transformed[col].max()
+                shift = max_val if max_val <= 0 else 0 #shift 0 if max is positive else shift by max
+                df_transformed[col] = 1 / np.sqrt(df_transformed[col] + shift)
+                trans = "inv_sqrt"
+                print(f"Due to moderate negative skewness, transformation applied: {trans}")
+            elif skew_val < -1:
+                max_val = df_transformed[col].max()
+                shift = max_val if max_val <= 0 else 0
+                df_transformed[col] = 1 / (df_transformed[col] + shift)
+                trans = "inv_transformation"
+                print(f"Due to high negative skewness, transformation applied: {trans}")
+            else:
+                trans = "none"  # No transformation applied
+                print(f"Normal skewness. No transformation applied.")
+            
+
+            if (df_transformed[col] < 0).any():
+                print(f" Column {col} has negative values after {trans} transformation.")
+                print("First 5 negative values after transformation:")
+                print(df_transformed[df_transformed[col] < 0][col].head())
+        else:
+            print(f"Warning: Column '{col}' not found in the DataFrame.")
+    return df_transformed
+    
+
+numerical_cols = [col for col in data_to_reduce.select_dtypes(include=np.number).columns if col != 'BAD'
+                and not ('_' in col)
+                and not (data_to_reduce[col].nunique() == 2 and all(x in [0, 1] for x in data_to_reduce[col].unique()))]
+
+transformed_data = transform_column_by_skew(data_to_reduce, numerical_cols)
+
+
+print("Original Data:")
+print(data_to_reduce)
+
+print("\nTransformed Data:")
+print(transformed_data)
+
+#Calculate skewness and kurtosis before transformation
+numerical_cols_before = data_to_reduce.select_dtypes(include=np.number).columns.tolist()
+if 'target' in numerical_cols_before:
+    numerical_cols_before.remove('target')
+skewness_before = data_to_reduce[numerical_cols_before].skew()
+kurtosis_before = data_to_reduce[numerical_cols_before].kurtosis()
+
+# Create DataFrame for before transformation
+skew_kurt_before_df = pd.DataFrame({'Skewness': skewness_before, 'Kurtosis': kurtosis_before})
+print("\nSkewness and Kurtosis Before Transformation:")
+print(skew_kurt_before_df)
+
+# Calculate skewness and kurtosis after transformation
+numerical_cols_after = transformed_data.select_dtypes(include=np.number).columns.tolist()
+if 'target' in numerical_cols_after:
+    numerical_cols_after.remove('target')
+skewness_after = transformed_data[numerical_cols_after].skew()
+kurtosis_after = transformed_data[numerical_cols_after].kurtosis()
+
+# Create DataFrame for after transformation
+skew_kurt_after_df = pd.DataFrame({'Skewness': skewness_after, 'Kurtosis': kurtosis_after})
+print("\nSkewness and Kurtosis After Transformation:")
+print(skew_kurt_after_df)
+
+#Double-checking if any column has -ve values:
+
+for col in numerical_cols:
+    if (transformed_data[col] < 0).any():
+        print(f" Column '{col}' still has negative values.")
+    else:
+        print(f" Column '{col}' has only positive values after transformation.")
+
+
+transformed_data.to_csv("Transformed_data.csv")
+
+#Visualizing outliers before Transformation:
+sns.set(style="whitegrid")
+plt.figure(figsize=(20, 25))
+
+columns = ['BAD','LOAN','MORTDUE','VALUE','YOJ','DEROG','DELINQ',
+           'CLAGE','NINQ','CLNO','DEBTINC','LoanPropertyRatio',
+           'CreditAgeRatio','CreditDelRatio']
+
+# box plot
+for i, col in enumerate(columns, 1):
+    plt.subplot(5, 3, i)
+    sns.boxplot(data=data_to_reduce, y=col, color="skyblue")
+    plt.title(f'Box Plot of {col}', fontsize=12)
+
+plt.tight_layout()
+plt.show()
+
+#Visualizing outliers after Transformation:
+sns.set(style="whitegrid")
+plt.figure(figsize=(20, 25))
+
+columns = ['BAD','LOAN','MORTDUE','VALUE','YOJ','DEROG','DELINQ',
+           'CLAGE','NINQ','CLNO','DEBTINC','LoanPropertyRatio',
+           'CreditAgeRatio','CreditDelRatio']
+
+# box plot
+for i, col in enumerate(columns, 1):
+    plt.subplot(5, 3, i)
+    sns.boxplot(data=transformed_data, y=col, color="skyblue")
+    plt.title(f'Box Plot of {col}', fontsize=12)
+
+plt.tight_layout()
+plt.show()
+
+%%time
+# Plotting the distribution of numerical features before transformation
+numerical_cols1 = data_to_reduce.select_dtypes(include=np.number).columns.tolist()
+#remove the target variable if it is numerical
+if 'BAD' in numerical_cols:
+  numerical_cols1.remove('BAD')
+  
+transformed_data_numerical = data_to_reduce[numerical_cols1]
+
+if not transformed_data_numerical.empty: #check if there are numerical columns
+    transformed_data_numerical.hist(figsize=(15, 10), bins=20)  # Increased bins for better resolution
+    plt.suptitle('Distribution of Numerical Features Before Log Transformation', fontsize=16)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])  # Adjust spacing to prevent overlap with suptitle
+    plt.show()
+else:
+    print("No numerical features to plot after log transformation.")
+
+
+# Plotting the distribution of the target variable
+plt.figure(figsize=(8, 6))
+sns.countplot(x='BAD', data=data_to_reduce, hue='BAD')
+plt.title('Distribution of Target Variable', fontsize=16)
+plt.show()
+
+%%time
+# Plotting the distribution of numerical features after transformation
+numerical_cols1 = transformed_data.select_dtypes(include=np.number).columns.tolist()
+#remove the target variable if it is numerical
+if 'BAD' in numerical_cols1:
+  numerical_cols1.remove('BAD')
+  
+transformed_data_numerical1 = transformed_data[numerical_cols1]
+
+if not transformed_data_numerical1.empty: #check if there are numerical columns
+    transformed_data_numerical1.hist(figsize=(15, 10), bins=20)  # Increased bins for better resolution
+    plt.suptitle('Distribution of Numerical Features After Log Transformation', fontsize=16)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])  # Adjust spacing to prevent overlap with suptitle
+    plt.show()
+else:
+    print("No numerical features to plot after log transformation.")
+
+
+# Plotting the distribution of the target variable
+plt.figure(figsize=(8, 6))
+sns.countplot(x='BAD', data=transformed_data, hue='BAD')
+plt.title('Distribution of Target Variable', fontsize=16)
+plt.show()
+
+## Z-score Method for Outliers Detection and Removal
+
+#### It's worth noting that a slightly relaxed threshold of 4.0 was used to avoid removing big portions of the data for interpretability purposes, while putting in mind to focus on tree-based models later in the modelling phase, which are robust in dealing with the remaining portion of the outliers
+
+
+
+%%time
+# Applying Z-score transformation to detect and remove outliers:
+
+# A function that detects outliers using the Z-score,
+    #then, returns the dataFrame with outliers removed.
+def remove_outliers_z(transformed_data, columns, threshold=4):    
+    
+    df_cleaned = transformed_data.copy()
+    outlier_summary = {}
+
+    for col in columns:
+        if col in df_cleaned.columns:
+            col_zscore = zscore(df_cleaned[col].dropna())
+            outliers = np.abs(col_zscore) > threshold
+            outlier_index = df_cleaned[col].dropna().index[outliers]
+            outlier_summary[col] = len(outlier_index)
+            df_cleaned = df_cleaned.drop(index=outlier_index)
+        else:
+            print(f"Column '{col}' not found in the DataFrame.")
+    return df_cleaned, outlier_summary
+
+
+#Defining a function thatVisualizes the distribution of numerical features before and
+# after outlier removal. Binary variables are excluded from the viusalization
+
+# 2. Visualization function
+def visualize_distributions(transformed_data, outlier_cleaned, columns, filename="outlier_removal_distribution.png"):
+    
+
+    n_cols = 3  # Number of columns in the subplot grid
+    n_rows = (len(columns) + n_cols - 1) // n_cols  # Calculate the number of rows
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5 * n_rows))
+    fig.subplots_adjust(hspace=0.4, wspace=0.3)  # Adjust spacing between subplots
+
+    for i, col in enumerate(columns):
+        if col not in transformed_data.columns or col not in df_cleaned.columns:
+            print(f"Column '{col}' not found in one of the DataFrames. Skipping visualization.")
+            continue  # Skip if column not found
+
+        row = i // n_cols
+        col_idx = i % n_cols
+        ax = axes[row, col_idx]
+
+        # Plot the distribution before outlier removal
+        sns.histplot(transformed_data[col], ax=ax, label='Before Outlier Removal', color='red', alpha=0.7)
+        # Plot the distribution after outlier removal
+        sns.histplot(df_cleaned[col], ax=ax, label='After Outlier Removal', color='green', alpha=0.7)
+        ax.set_title(col)
+        ax.legend()
+
+    # Remove any unused subplots
+    if len(columns) < n_rows * n_cols:
+        for j in range(len(columns), n_rows * n_cols):
+            fig.delaxes(axes.flatten()[j])
+
+    plt.suptitle('Distribution of Numerical Features Before and After Outlier Removal', fontsize=16)
+    plt.savefig(filename)  # Save the figure
+    plt.show() #show the plot
+
+
+
+# 3. Define the columns to check
+columns = ['BAD','LOAN','MORTDUE','VALUE','YOJ','DEROG','DELINQ','CLAGE','NINQ','CLNO','DEBTINC','LoanPropertyRatio','CreditAgeRatio','CreditDelRatio']
+
+
+# Setting the Z-score threshold:
+z_threshold = 4
+
+# 4. Apply Z-score outlier removal
+df_cleaned, outlier_summary = remove_outliers_z(transformed_data.copy(), columns, z_threshold)
+
+# 5. Print the results
+print("Original data：", transformed_data.shape[0])
+print("Data after removing outliers：", df_cleaned.shape[0])
+print(f"% of outliers removed: {(len(transformed_data)-len(df_cleaned))/len(transformed_data)*100: .2f}%")
+print("Outliers in each column：")
+for col, count in outlier_summary.items():
+    print(f"{col}: {count}")
+
+# 6. Display the cleaned DataFrame
+df_cleaned = df_cleaned.reset_index(drop=True)
+print(df_cleaned.head())
+
+# 7.  Visualize
+visualize_distributions(transformed_data, df_cleaned, columns, filename="z_score_outlier_removal.png")
+
+df_cleaned.to_csv("Data_After_Zscore.csv")
+
+%%time
+#IQR box plots to visualize outliers after Z-score:
+sns.set(style="whitegrid")
+plt.figure(figsize=(20, 25))
+
+columns = ['BAD','LOAN','MORTDUE','VALUE','YOJ','DEROG','DELINQ',
+           'CLAGE','NINQ','CLNO','DEBTINC','LoanPropertyRatio',
+           'CreditAgeRatio','CreditDelRatio']
+
+# box plot
+for i, col in enumerate(columns, 1):
+    plt.subplot(5, 3, i)
+    sns.boxplot(data=df_cleaned, y=col, color="skyblue")
+    plt.title(f'Box Plot of {col}', fontsize=12)
+
+plt.tight_layout()
+plt.show()
+
+df_cleaned
+
+============================================================================
+
+
+# FEATURE SELECTION
+
+
+============================================================================
+
+%%time
+#Random Forest
+#Dividing the data into training and testing sets
+
+X = df_cleaned.drop(columns=['BAD'])
+y = df_cleaned['BAD']
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=42,stratify=y) 
+model = RandomForestClassifier(n_estimators=50, max_depth=10, min_samples_leaf=5, random_state=42)
+model.fit(X_train, y_train)
+
+# Original Cross Validation Score
+# Accuracy
+original_scores = cross_val_score(model, X, y, cv=10, scoring='accuracy')
+original_accuracy_cv_mean = original_scores.mean()
+original_accuracy_cv_std = original_scores.std()
+
+train_acc_ori = accuracy_score(y_train, model.predict(X_train))
+y_pred = model.predict(X_test)
+test_acc_ori = accuracy_score(y_test, y_pred)
+
+# AUC 
+original_scores_auc = cross_val_score(model, X, y, cv=10, scoring='roc_auc')
+original_auc_cv_mean = original_scores_auc.mean()
+original_auc_cv_std = original_scores_auc.std()
+
+train_auc_ori = roc_auc_score(y_train,model.predict_proba(X_train)[:, 1])
+y_pred_prob = model.predict_proba(X_test)[:, 1]
+test_auc_ori = roc_auc_score(y_test, y_pred_prob)
+
+# Built-in Feature Importance: This method utilizes the model's internal calculations to measure feature importance. 
+# Built-in feature importance: Gini Importance, reduce the impurity within a node of a decision tree when a specific feature is used to split the data
+importances_gini = pd.DataFrame({'Feature': X.columns, 'Gini Importance': model.feature_importances_})
+importances_gini = importances_gini.sort_values('Gini Importance', ascending=False)
+print("\nFeature Importance by Gini Importance:")
+print(importances_gini)
+
+plt.figure(figsize=(12, 6))
+plt.barh(importances_gini['Feature'], importances_gini['Gini Importance'], color='royalblue')
+plt.xlabel('Importance Score')
+plt.title('Feature Importance - Gini Importance')
+plt.gca().invert_yaxis() 
+plt.show()
+
+#set threshold for feature importance
+low_importance_gini = importances_gini[importances_gini['Gini Importance'] < 0.01]
+print(f"Low importance from gini:\n{low_importance_gini}")
+
+features_to_be_deleted = set(low_importance_gini['Feature'])
+print("Features to be deleted:", features_to_be_deleted)
+
+# Keep the most important features
+data_to_reduce_selected = df_cleaned.drop(columns=features_to_be_deleted)
+print(data_to_reduce_selected)
+
+#Calculate skewness and kurtosis before and after z-score and feature selection:
+
+df_cleaned = pd.read_csv('Data_After_Zscore.csv')
+numerical_cols_before = df_cleaned.select_dtypes(include=np.number).columns.tolist()
+if 'target' in numerical_cols_before:
+    numerical_cols_before.remove('target')
+skewness_before = df_cleaned[numerical_cols_before].skew()
+kurtosis_before = df_cleaned[numerical_cols_before].kurtosis()
+
+# Create DataFrame for before z-score
+skew_kurt_before_df = pd.DataFrame({'Skewness': skewness_before, 'Kurtosis': kurtosis_before})
+print("\nSkewness and Kurtosis Before Transformation:")
+print(skew_kurt_before_df)
+
+# Calculate skewness and kurtosis after z-score
+numerical_cols_after = data_to_reduce_selected.select_dtypes(include=np.number).columns.tolist()
+if 'target' in numerical_cols_after:
+    numerical_cols_after.remove('target')
+skewness_after = data_to_reduce_selected[numerical_cols_after].skew()
+kurtosis_after = data_to_reduce_selected[numerical_cols_after].kurtosis()
+
+# Create DataFrame for after z-score
+skew_kurt_after_df = pd.DataFrame({'Skewness': skewness_after, 'Kurtosis': kurtosis_after})
+print("\nSkewness and Kurtosis After Transformation:")
+print(skew_kurt_after_df)
+
+%%time 
+#Random Forest After Features Removal and Trasformation
+X_reduced = data_to_reduce_selected.drop(columns=['BAD'])
+y_reduced = data_to_reduce_selected['BAD']
+
+X_train_reduced, X_test_reduced, y_train_reduced, y_test_reduced = train_test_split(X_reduced, y_reduced, test_size=0.20, random_state=42) 
+model_reduced = RandomForestClassifier(n_estimators=50, max_depth=10, min_samples_leaf=5, random_state=42)
+model_reduced.fit(X_train_reduced, y_train_reduced)
+
+# Adjusted Cross Validation Score
+# Accuracy
+adjusted_scores = cross_val_score(model_reduced, X_reduced, y_reduced, cv=10, scoring='accuracy')
+adjusted_accuracy_cv_mean = adjusted_scores.mean()
+adjusted_accuracy_cv_std = adjusted_scores.std()
+
+train_acc_adj = accuracy_score(y_train_reduced, model_reduced.predict(X_train_reduced))
+y_pred_reduced = model_reduced.predict(X_test_reduced)
+test_acc_adj = accuracy_score(y_test_reduced, y_pred_reduced)
+
+# AUC 
+adjusted_scores_auc = cross_val_score(model_reduced, X_reduced, y_reduced, cv=10, scoring='roc_auc')
+adjusted_auc_cv_mean = adjusted_scores_auc.mean()
+adjusted_auc_cv_std = adjusted_scores_auc.std()
+
+train_auc_adj = roc_auc_score(y_train_reduced,model_reduced.predict_proba(X_train_reduced)[:, 1])
+y_pred_prob_adj = model_reduced.predict_proba(X_test_reduced)[:, 1]
+test_auc_adj = roc_auc_score(y_test_reduced, y_pred_prob_adj)
+
+# Score Comparison for feature selection (before vs after)
+comparison_table = pd.DataFrame({
+    "Test Contents": [
+        "CV Accuracy", "Train Accuracy", "Test Accuracy", 
+        "CV AUC", "Train AUC", "Test AUC"
+    ],
+    "Model Scores Before / After Feature Selection": [
+        f"{original_accuracy_cv_mean:.4f} ± {original_accuracy_cv_std:.4f} / {adjusted_accuracy_cv_mean:.4f} ± {adjusted_accuracy_cv_std:.4f}",
+        f"{train_acc_ori:.4f} / {train_acc_adj:.4f}",
+        f"{test_acc_ori:.4f} / {test_acc_adj:.4f}",
+        f"{original_auc_cv_mean:.4f} ± {original_auc_cv_std:.4f} / {adjusted_auc_cv_mean:.4f} ± {adjusted_auc_cv_std:.4f}",
+        f"{train_auc_ori:.4f} / {train_auc_adj:.4f}",
+        f"{test_auc_ori:.4f} / {test_auc_adj:.4f}"
+    ]
+})
+
+print(comparison_table)
+
+data_to_reduce_selected.to_csv("Reduced_Data_FINAL.csv")
