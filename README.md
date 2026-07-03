@@ -20,7 +20,7 @@ Key features: DEBTINC (debt-to-income ratio), DEROG (derogatory reports), DELINQ
 
 🛠️ Tools & Libraries
 
-- Language: Python
+- Language: Python, SAS
 - Libraries: pandas, NumPy, scikit-learn (Random Forest, Logistic Regression, RandomizedSearchCV, StratifiedKFold), Matplotlib/Seaborn
 - Techniques: Median/zero imputation, one-hot encoding, stratified train-test split, hyperparameter tuning, threshold optimisation, precision-recall analysis, feature importance (Random Forest)
 
