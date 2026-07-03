@@ -1,0 +1,200 @@
+# RANDOM FOREST
+
+============================================================================
+
+data_to_reduce_selected = pd.read_csv("Reduced_Data_FINAL.csv", index_col=0)
+data_to_reduce_selected.head()
+
+## Question 1
+
+# §§§ Step 1: Define Features and Target §§§
+X = data_to_reduce_selected.drop(columns=['BAD'])  # Features
+y = data_to_reduce_selected['BAD']                 # Target
+
+# §§§ Step 2: Split into Train and Test §§§
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# §§§ Step 3: Initialize Model §§§
+rf_model = RandomForestClassifier(
+    n_estimators=100,
+    max_depth=12,
+    min_samples_leaf=2,
+    class_weight='balanced',
+    random_state=42
+)
+
+# §§§ Step 4: Cross-Validation AUC & Predictions §§§
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+cv_auc_scores = []
+cv_val_preds = np.zeros(len(X_train))  # For storing validation probabilities
+
+for train_idx, val_idx in cv.split(X_train, y_train):
+    X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+    y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+
+    model = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=12,
+        min_samples_leaf=2,
+        class_weight='balanced',
+        random_state=42
+    )
+    model.fit(X_tr, y_tr)
+
+    val_probs = model.predict_proba(X_val)[:, 1]
+    cv_val_preds[val_idx] = val_probs
+
+    fold_auc = roc_auc_score(y_val, val_probs)
+    cv_auc_scores.append(fold_auc)
+
+print(f"\n Cross-Validation AUC: {np.mean(cv_auc_scores):.4f} ± {np.std(cv_auc_scores):.4f}")
+
+# §§§ Step 5: Retrain model on full train set §§§
+rf_model.fit(X_train, y_train)
+
+# §§§ Step 6: Predict on Train & Test §§§
+y_train_probs = rf_model.predict_proba(X_train)[:, 1]
+y_test_probs  = rf_model.predict_proba(X_test)[:, 1]
+
+train_auc = roc_auc_score(y_train, y_train_probs)
+test_auc = roc_auc_score(y_test, y_test_probs)
+print(f"\nTrain AUC: {train_auc:.4f}")
+print(f" Test AUC: {test_auc:.4f}")
+
+# §§§ Step 7: Find Thresholds Meeting Constraint §§§
+print("\n Thresholds Meeting ≥85% BAD Recall (on Test Set)")
+print("Threshold | Recall (BAD) | Precision (GOOD) | TP | TN | FP | FN | F1 (BAD)")
+print("___________________________________________________________________________ \n")
+
+thresholds = np.arange(0.0, 1.01, 0.01)
+best_config = None
+max_good_accepted = -1
+
+for thr in thresholds:
+    y_pred = (y_test_probs >= thr).astype(int)
+    report = classification_report(y_test, y_pred, output_dict=True, zero_division = 0)
+
+    recall_bad = report['1']['recall']
+    precision_good = report['0']['precision']
+    f1_bad = report['1']['f1-score']
+
+    cm = confusion_matrix(y_test, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+
+    if recall_bad >= 0.85:
+        print(f"{thr:.2f}      | {recall_bad:.2f}       | {precision_good:.2f}         | {tp:>2} | {tn:>2} | {fp:>2} | {fn:>2} | {f1_bad:.2f}")
+
+        if tn > max_good_accepted:
+            max_good_accepted = tn
+            best_config = {
+                "threshold": thr,
+                "y_pred": y_pred,
+                "report": report,
+                "confusion": cm
+            }
+
+# §§§ Step 7: Threshold Adjustment §§§
+print(f"Train AUC: {train_auc:.4f}")
+print(f"Test AUC:  {test_auc:.4f}")
+
+#threshold = 0.33  # You can tune this manually
+threshold = 0.33  # You can tune this manually
+y_pred_adjusted = (y_test_probs >= threshold).astype(int)
+
+accuracy = accuracy_score(y_test, y_pred_adjusted)
+print(f"Adjusted Accuracy: {accuracy:.4f}")
+
+# §§§ Step 8: Evaluation Metrics §§§
+print("\n Adjusted Classification Report (Test Data):")
+print(classification_report(y_test, y_pred_adjusted))
+
+print("Confusion Matrix:")
+print(confusion_matrix(y_test, y_pred_adjusted))
+
+## Question 2
+
+# §§§ Step 1: Define Features and Target §§§
+X = data_to_reduce_selected.drop(columns=['BAD'])  # Features
+y = data_to_reduce_selected['BAD']                 # Target
+
+# §§§ Step 2: Split into Train and Test §§§
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# §§§ Step 3: Create Random Forest Model §§§
+rf_model = RandomForestClassifier(
+    n_estimators=100,
+    max_depth=12,
+    min_samples_leaf=2,
+    class_weight='balanced',
+    random_state=42
+)
+
+# §§§ Step 4: Cross-Validation for AUC and Model Selection §§§
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+cv_aucs = []
+models = []
+
+for train_idx, val_idx in skf.split(X_train, y_train):
+    X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+    y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+
+    m = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=12,
+        min_samples_leaf=2,
+        class_weight='balanced',
+        random_state=42
+    )
+    m.fit(X_tr, y_tr)
+    models.append(m)
+
+    val_probs = m.predict_proba(X_val)[:, 1]
+    cv_aucs.append(roc_auc_score(y_val, val_probs))
+
+print(f"Cross-Validation AUC: {np.mean(cv_aucs):.4f} ± {np.std(cv_aucs):.4f}")
+
+# §§§ Step 5: Fit Final Model on All Training Data §§§
+rf_model.fit(X_train, y_train)
+
+# §§§ Step 6: Predict Probabilities §§§
+y_train_probs = rf_model.predict_proba(X_train)[:, 1]
+y_test_probs  = rf_model.predict_proba(X_test)[:, 1]
+
+# §§§ Step 7: AUC Scores §§§
+train_auc = roc_auc_score(y_train, y_train_probs)
+test_auc = roc_auc_score(y_test, y_test_probs)
+print(f"Train AUC: {train_auc:.4f}")
+print(f"Test AUC:  {test_auc:.4f}")
+
+# §§§ Step 7: Threshold Adjustment §§§
+print(f"Train AUC: {train_auc:.4f}")
+print(f"Test AUC:  {test_auc:.4f}")
+
+accuracy = accuracy_score(y_test, y_pred_adjusted)
+print(f"Adjusted Accuracy: {accuracy:.4f}")
+
+threshold = 0.42  # You can tune this manually
+y_pred_adjusted = (y_test_probs >= threshold).astype(int)
+
+# §§§ Step 8: Evaluation Metrics §§§
+print("\n Adjusted Classification Report (Test Data):")
+print(classification_report(y_test, y_pred_adjusted))
+
+print("Confusion Matrix:")
+print(confusion_matrix(y_test, y_pred_adjusted))
+
+# Get feature importances and sort them
+importances = rf_model.feature_importances_
+indices = np.argsort(importances)[::-1]  # Sorting in descending order
+
+# Plot the feature importance
+plt.figure(figsize=(10, 6))
+plt.barh(X.columns[indices], importances[indices])
+plt.xlabel('Importance')
+plt.title('Feature Importance - Random Forest')
+plt.gca().invert_yaxis()  # To have the most important features at the top
+plt.show()
